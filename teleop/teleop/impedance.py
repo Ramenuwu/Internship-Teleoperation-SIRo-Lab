@@ -24,7 +24,7 @@ class TiagoImpedance(Node):
         self.fk_client = self.create_client(GetPositionFK, "/compute_fk")
 
         # Load URDF and create model/data
-        urdf_path = "/intern_ws/src/teleop/tiago_mirror_moveit.urdf"
+        urdf_path = "src/teleop/tiago_mirror_moveit.urdf"
         self.model = pin.buildModelFromUrdf(urdf_path)
         self.data = self.model.createData()
 

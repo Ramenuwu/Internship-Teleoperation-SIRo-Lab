@@ -34,7 +34,7 @@ class GravComp(Node):
             "arm_right_7_joint",
         ]
 
-        urdf_path = "/intern_ws/tiago_mirror_moveit.urdf"
+        urdf_path = "src/teleop/tiago_mirror_moveit.urdf"
         self.model = pin.buildModelFromUrdf(urdf_path)
         self.data = self.model.createData()
         self.full_q = pin.neutral(self.model)
@@ -69,7 +69,7 @@ class GravComp(Node):
 
         # Gravity compensation + any additional efforts from other nodes
         gravity_full = pin.computeGeneralizedGravity(self.model, self.data, self.full_q)
-        gravcomp_tau_arm = gravity_full[self.arm_vel_idx] #* 0.465
+        gravcomp_tau_arm = gravity_full[self.arm_vel_idx] * 0.465
         total_tau = gravcomp_tau_arm + self.additional_efforts
 
         #print(total_tau)

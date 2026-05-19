@@ -24,7 +24,7 @@ class TiagoImpedance(Node):
         self.fk_client = self.create_client(GetPositionFK, "/compute_fk")
 
         # Load URDF and create model/data
-        urdf_path = "/intern_ws/tiago_mirror_moveit.urdf"
+        urdf_path = "src/teleop/tiago_mirror_moveit.urdf"
         self.model = pin.buildModelFromUrdf(urdf_path)
         self.data = self.model.createData()
 
@@ -82,7 +82,7 @@ class TiagoImpedance(Node):
         # Control state
         self.base_offset = np.array([0.0, 0.4, 0.5])
 
-        self.x_des = np.array([0.279, -0.209, 0.838]) #0.279, -0.209, 0.638
+        self.x_des = np.array([-0.279, -0.209, -0.2]) #0.279, -0.209, 0.0
         self.R_des = np.diag([1.0,1.0,1.0])
         self.x_curr = np.array([0,0,0])
 
@@ -225,14 +225,19 @@ class TiagoImpedance(Node):
             tau_task = J6_arm.T @ F_tau                     # (7,)
 
             # ── 6. Nullspace torques N2 ───────────────────────────────
-            _, s_vals, Vt = np.linalg.svd(J6_arm, full_matrices=True)
+            _, s_vals, Vt = np.linalg.svd(J6_arm, full_matrices=False)
             rank     = int(np.sum(s_vals > 1e-6))    # should be 6 for non-singular
             Z        = Vt[rank:].T                    # (7 × 1) for a 7-DOF arm
             N2       = M_arm @ (Z @ Z.T)
 
+            q_min  = np.array([-0.5235987755982988,-2.443460952792061,-2.6179938779914944,-2.443460952792061,-3.6651914291880923,-1.8849555921538759,-2.6179938779914944])   # your robot's lower limits
+            q_max  = np.array([4.71238898038469,1.1344640137963142,2.6179938779914944,1.1344640137963142,1.5707963267948966,3.001966313430247,2.6179938779914944])   # your robot's upper limits
+            q_mid  = 0.5 * (q_min + q_max)
+
+
             K_null   = 5.0
             D_null   = 3.0
-            tau_d_N  = (-K_null * (self.full_q[self.arm_q_idx] - np.zeros(7)) - D_null * self.dq)
+            tau_d_N = -K_null * (self.q - q_mid) - D_null * self.dq
             tau_null = N2 @ tau_d_N
 
             # ── 7. Gravity + Coriolis ────────────────────────────────────────────────

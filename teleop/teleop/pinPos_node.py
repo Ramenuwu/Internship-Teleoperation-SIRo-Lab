@@ -12,6 +12,7 @@ from moveit_msgs.srv import GetPositionFK
 import numpy as np
 from moveit_msgs.msg import RobotState
 from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import WrenchStamped
 from sensor_msgs.msg import JointState
 
 
@@ -23,14 +24,14 @@ class TiagoImpedance(Node):
         self.fk_client = self.create_client(GetPositionFK, "/compute_fk")
 
         # Load URDF and create model/data
-        urdf_path = "/intern_ws/tiago_mirror_moveit.urdf"
+        urdf_path = "src/teleop/tiago_mirror_moveit.urdf"
         self.model = pin.buildModelFromUrdf(urdf_path)
         self.data = self.model.createData()
 
         # Publisher for effort controller
         self.effort_pub = self.create_publisher(
             Float64MultiArray,
-            '/arm_right_effort_controller/commands',
+            '/arm_left_effort_controller/torque_commands',
             10
         )
 
@@ -38,6 +39,9 @@ class TiagoImpedance(Node):
         self.dq = np.zeros(7)
         self.full_q = pin.neutral(self.model)
         self.full_dq = np.zeros(self.model.nv)
+
+        self.EEweightkg = 0.07768 #kg
+        self.EEweightN = self.EEweightkg * 9.81
         
         # Subscriber
         self.create_subscription(
@@ -46,11 +50,18 @@ class TiagoImpedance(Node):
             self.joint_state_cb,
             10
         )
+
+        self.create_subscription(
+            WrenchStamped,
+            "/ft_sensor_left_controller/wrench",
+            self.wrench_cb,
+            10
+        )
         
         self.joint_names = [
-            "arm_right_1_joint", "arm_right_2_joint", "arm_right_3_joint",
-            "arm_right_4_joint", "arm_right_5_joint", "arm_right_6_joint",
-            "arm_right_7_joint",
+            "arm_left_1_joint", "arm_left_2_joint", "arm_left_3_joint",
+            "arm_left_4_joint", "arm_left_5_joint", "arm_left_6_joint",
+            "arm_left_7_joint",
         ]
 
         #wheels are NAN in joint_states
@@ -69,9 +80,18 @@ class TiagoImpedance(Node):
         ]
 
         # Control state
-        self.x_des = np.array([0.45, -0.5, 0.4]) #np.array([0.22436758, 0.27037221, 0.15008332])
-        self.R_des = np.eye(3)
+        self.base_offset = np.array([0.0, 0.2, 0.7])
+
+        self.x_des = np.array([0.0, 0.0, 0.0]) #0.279, -0.209, 0.0
+        self.R_des = np.diag([1.0,1.0,1.0])
         self.x_curr = np.array([0,0,0])
+
+        self.F_ext = np.zeros(6)
+
+        self.F_des = np.zeros(6)
+        self.F_tau = np.zeros(6)
+
+        self.alpha = 0.2
         
         # Flag to prevent concurrent control calculations
         self.control_running = False
@@ -85,8 +105,32 @@ class TiagoImpedance(Node):
         self.pub_tau_task      = self.create_publisher(Float64MultiArray, '/dbg/tau_task_arm', 10)
         self.pub_nle_full      = self.create_publisher(Float64MultiArray, '/dbg/nle_full', 10)
         self.pub_q_full      = self.create_publisher(Float64MultiArray, '/dbg/q_full', 10)
+        self.pub_F_ext      = self.create_publisher(Float64MultiArray, '/dbg/F_ext', 10)
 
         print("init done")
+
+    def wrench_cb(self, msg: WrenchStamped):
+        
+        R = self.data.oMf[self.model.getFrameId("arm_left_7_link")].rotation
+
+        f_sensor = np.array([msg.wrench.force.x,
+                             msg.wrench.force.y,
+                             msg.wrench.force.z])
+        t_sensor = np.array([msg.wrench.torque.x,
+                             msg.wrench.torque.y,
+                             msg.wrench.torque.z])
+        
+        # Rotate from sensor frame into world/base_footprint frame
+        self.F_ext[0:3] = R @ f_sensor
+        self.F_ext[3:6] = R @ t_sensor
+        #compensate sensor weight: 0.6736N straight downwards
+        self.F_ext[2] += self.EEweightN
+        #self.F_ext = np.zeros(6)
+
+        if self.data.oMf[self.model.getFrameId("arm_left_7_link")].translation[0] > 0.25:      # places a virtual wall at x 3.5
+            self.F_ext[0] -= self.F_tau[0]
+            print("hittin wall")
+
 
     def joint_state_cb(self, msg: JointState):
         name_to_index = {name: i for i, name in enumerate(msg.name)}
@@ -109,179 +153,127 @@ class TiagoImpedance(Node):
                 self.dq[i] = msg.velocity[idx_msg]
 
     def control_timer_callback(self):
-        if self.control_running:
-            return
-        self.control_running = True
+        #if self.control_running:
+        #    return
+        #self.control_running = True
 
         try:
-            # ── 1. Analytic Jacobian via pinocchio (replaces _numeric_jacobian_pos) ──
-            frame_id = self.model.getFrameId("arm_right_7_link")
+            frame_id = self.model.getFrameId("arm_left_7_link")
 
-            pin.forwardKinematics(self.model, self.data, self.full_q, self.full_dq, np.zeros(self.model.nv))   # zero ddq → data.a = J̇q̇
+            # ── 1. Kinematics ────────────────────────────────────────────────────────
+            pin.forwardKinematics(self.model, self.data, self.full_q, self.full_dq, np.zeros(self.model.nv))
             pin.updateFramePlacements(self.model, self.data)
 
+            # Full 6×nv Jacobian (rows 0:3 = linear, 3:6 = angular)
             J_full = pin.computeFrameJacobian(self.model, self.data, self.full_q, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+            J6_arm = J_full[:, self.arm_vel_idx]        # (6 × 7)
 
-            J = J_full[0:3, :]                              # positional rows, (3 × nv)
-            J_arm = J[:, self.arm_vel_idx]                  # (3 × 7)
+            # Current pose
+            T_curr      = self.data.oMf[frame_id]
+            self.x_curr = T_curr.translation.copy()     # (3,)
+            R_curr      = T_curr.rotation               # (3 × 3)
 
-            #print(J_arm)
+            # J̇q̇  — full 6D bias acceleration
+            frame_acc = pin.getFrameAcceleration(self.model, self.data, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+            Jdot_qdot_6 = np.concatenate([frame_acc.linear, frame_acc.angular])               # (6,)
 
-            # Current end-effector position
-            self.x_curr = self.data.oMf[frame_id].translation.copy()
+            # ── 2. Cartesian mass matrix Λ(q) ─────────────────────────────
+            M_full  = pin.crba(self.model, self.data, self.full_q)
+            M_arm   = M_full[np.ix_(self.arm_vel_idx, self.arm_vel_idx)]   # (7 × 7)
 
-            # J̇q̇  — bias acceleration (Coriolis in Cartesian space)
-            #   pinocchio gives this directly when ddq=0 was passed above
-            frame_acc   = pin.getFrameAcceleration(self.model, self.data, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-            Jdot_qdot   = frame_acc.linear                  # (3,)
+            JMinvJt = J6_arm @ np.linalg.solve(M_arm, J6_arm.T)
+            Lambda  = np.linalg.inv(JMinvJt + 1e-6 * np.eye(6))           # (6 × 6)
 
-            # ── 2. Cartesian mass matrix  Λ(q) = (J M⁻¹ Jᵀ)⁻¹  (eq. 12) ──────────
-            M_full = pin.crba(self.model, self.data, self.full_q)
-            M_arm  = M_full[np.ix_(self.arm_vel_idx, self.arm_vel_idx)]  # (7 × 7)
+            # ── 3. Gains ─────────────────────────────────────────────────────────────────
+            # Desired inertia. can be set freely, independent of Λ(q), i think its not actually supposed to be changed tho.
+            # Start with Λ_d = Λ(q) (identity scaling) so behaviour matches eq 19,
+            # then reduce to make arm feel lighter to the environment
+            Lambda_d = Lambda.copy()    # (6×6)
+            Lambda_d_inv = np.linalg.inv(Lambda_d)
 
-            lambda_damp  = 1e-6
-            JMinvJt      = J_arm @ np.linalg.solve(M_arm, J_arm.T)
-            Lambda       = np.linalg.inv(JMinvJt + lambda_damp * np.eye(3))  # (3 × 3)
+            Kp = np.diag([1000.0, 1000.0, 1000.0,
+                        50.0,  50.0,  50.0])
 
-            # ── 3. Impedance gains ───────────────────────────────────────────────────
-            #   Tune Kp first; Kd is derived for critical-ish damping (paper Sec. VI A)
-            #   Dd = A·Kd1 + Kd1·A  where A²=Λ, Kd1²=Kp  → diagonal approx below
-            Kp = np.diag([1000.0, 1000.0, 1000.0])
-            xi = 0.1   # damping ratio per axis (1.0 = critically damped)
+            xi = 0.5
+            Lambda_d_sqrt = np.diag(np.sqrt(np.diag(Lambda_d)))
+            Kp_sqrt       = np.diag(np.sqrt(np.diag(Kp)))
 
-            # Factorization damping design (paper eq. 27):
-            #   Dd = 2 · ξ · sqrt(Λ) · sqrt(Kp)
-            Lambda_sqrt = np.diag(np.sqrt(np.diag(Lambda)))   # diagonal approximation
-            Kp_sqrt     = np.diag(np.sqrt(np.diag(Kp)))
-            Kd = 2.0 * xi * (Lambda_sqrt @ Kp_sqrt)           # (3 × 3), config-adaptive
+            # Damping designed against Λ_d now, not Λ(q)
+            Kd = 2.0 * xi * (Lambda_d_sqrt @ Kp_sqrt)              # (6×6)
 
-            # ── 4. Errors ────────────────────────────────────────────────────────────
-            error  = self.x_curr - self.x_des          # position error  e_x
+            # ── 4. Errors ─────────────────────────────────────────────────────────────────
+            e_pos   = self.x_curr - (self.x_des + self.base_offset)
+            R_err   = R_curr @ self.R_des.T
+            e_ori   = pin.log3(R_err)
+            error_6 = np.concatenate([e_pos, e_ori])                # (6,)
 
-            v_des = 0.0
-            v_ee   = J_arm @ self.dq                   # end-effector velocity
-            v_err  = v_ee - v_des                       # velocity error  ė_x  (v_des=0)
+            v_6     = J6_arm @ self.dq                              # (6,)
 
-            # ── 5. Full task-space force law  (paper eq. 19) ─────────────────────────
+            # ── 5. Full impedance law ──────────────────────────────────────────
             #
-            #   F_τ = Λ(q)·ẍ_d  −  Kd·ė_x  −  Kp·e_x  −  Λ(q)·J̇(q)·q̇
-            #         └──────┘    └────────────────────┘   └────────────┘
-            #         ff accel    impedance forces          Coriolis corr.
+            #   F_τ = Λ(q)·ẍ_d
+            #         − Λ(q)·Λ_d⁻¹·(Dd·ė_x + Kd·e_x)    ← stiffness/damping scaled by Λ/Λ_d
+            #         + (Λ(q)·Λ_d⁻¹ − I)·F_ext           ← inertia shaping from F_ext
+            #         − Λ(q)·J̇q̇                           ← Coriolis correction
             #
-            xdd_des = np.zeros(3)   # constant target → zero desired acceleration
+            xdd_des     = np.zeros(6)
 
-            F_tau   = (Lambda @ xdd_des
-                       - Kd    @ v_err
-                       - Kp    @ error
-                       - Lambda @ Jdot_qdot)           # eq. 19
+            LLdinv      = Lambda @ Lambda_d_inv                     # (6×6)
 
-            tau_task = J_arm.T @ F_tau                # eq. 20 (NLE added below)
+            self.F_tau = (Lambda  @ xdd_des
+                     - LLdinv @ ((Kd @ v_6 + Kp @ error_6) * self.alpha)
+                     + (LLdinv - np.eye(6)) @ self.F_ext
+                     + self.F_des
+                     - Lambda @ Jdot_qdot_6)                    # (6,)
+  
+            
+            tau_task = J6_arm.T @ self.F_tau                     # (7,)
 
-            # ── 6. Nullspace torques  N2 (paper eq. 17) ─────────────────────────────
-            _, s_vals, Vt = np.linalg.svd(J_arm, full_matrices=True)
-            rank    = int(np.sum(s_vals > 1e-6))
-            Z       = Vt[rank:].T                      # (7 × 4) null-space basis
-            N2      = M_arm @ (Z @ Z.T)                # dynamically consistent
+            # ── 6. Nullspace torques N2 ───────────────────────────────
+            _, s_vals, Vt = np.linalg.svd(J6_arm, full_matrices=False)
+            rank     = int(np.sum(s_vals > 1e-6))    # should be 6 for non-singular
+            Z        = Vt[rank:].T                    # (7 × 1) for a 7-DOF arm
+            N2       = M_arm @ (Z @ Z.T)
 
-            K_null  = 5
-            D_null  = 3
-            q_rest  = np.zeros(7)
-            tau_d_N = (-K_null * (self.full_q[self.arm_q_idx] - q_rest)
-                       - D_null * self.dq)
+            q_min  = np.array([-0.5235987755982988,-2.443460952792061,-2.6179938779914944,-2.443460952792061,-3.6651914291880923,-1.8849555921538759,-2.6179938779914944])   # your robot's lower limits
+            q_max  = np.array([4.71238898038469,1.1344640137963142,2.6179938779914944,1.1344640137963142,1.5707963267948966,3.001966313430247,2.6179938779914944])   # your robot's upper limits
+            q_mid  = 0.5 * (q_min + q_max)
+
+
+            K_null   = 5.0
+            D_null   = 3.0
+            tau_d_N = -K_null * (self.q - q_mid) - D_null * self.dq
             tau_null = N2 @ tau_d_N
 
-            # ── 7. Gravity + Coriolis  (eq. 20) ─────────────────────────────────────
+            # ── 7. Gravity + Coriolis ────────────────────────────────────────────────
             nle        = pin.nonLinearEffects(self.model, self.data, self.full_q, self.full_dq)
-            nle_arm    = nle[self.arm_vel_idx]
+            grav       = pin.computeGeneralizedGravity(self.model, self.data, self.full_q)
+            nle_nograv = nle - grav
 
-            tau_des_arm = tau_null + tau_task + nle_arm * 0.465 # keep your empirical scale for now
+            #nle_grav_scaled = nle_nograv + grav*0.465          #Gravity not needed with the new custom Controller
+
+            #nle_arm    = nle_grav_scaled[self.arm_vel_idx]
+            nle_arm    = nle_nograv[self.arm_vel_idx]
+
+            tau_des_arm_calc = tau_task + tau_null + nle_arm
+
+            tau_des_arm = np.clip(tau_des_arm_calc, -15, 15) ##clip to 15N
 
             # ── 8. Publish ───────────────────────────────────────────────────────────
             self.effort_pub.publish(Float64MultiArray(data=tau_des_arm.tolist()))
 
-            # debug topics
-            self.pub_error.publish(Float64MultiArray(data=error.tolist()))
-            self.pub_verr .publish(Float64MultiArray(data=v_err.tolist()))
-            self.pub_fimp .publish(Float64MultiArray(data=F_tau.tolist()))
-            self.pub_nle  .publish(Float64MultiArray(data=nle_arm.tolist()))
-            self.pub_tau  .publish(Float64MultiArray(data=tau_des_arm.tolist()))
+            self.pub_error   .publish(Float64MultiArray(data=error_6.tolist()))
+            self.pub_verr    .publish(Float64MultiArray(data=v_6.tolist()))
+            self.pub_fimp    .publish(Float64MultiArray(data=self.F_tau.tolist()))
+            self.pub_nle     .publish(Float64MultiArray(data=nle_arm.tolist()))
+            self.pub_tau     .publish(Float64MultiArray(data=tau_des_arm.tolist()))
             self.pub_tau_task.publish(Float64MultiArray(data=tau_task.tolist()))
             self.pub_nle_full.publish(Float64MultiArray(data=nle.tolist()))
             self.pub_q_full  .publish(Float64MultiArray(data=self.full_q.tolist()))
+            self.pub_F_ext       .publish(Float64MultiArray(data=self.F_ext.tolist()))
 
         finally:
             self.control_running = False
-
-    def _numeric_jacobian_pos(self, q, step=1e-3):
-        """Compute Jacobian numerically"""
-        n = q.shape[0]
-
-        p0 = self._fk_pos(q)
-        if p0 is None:
-            print("FK failed!")
-            return None, None
-
-
-        J = np.zeros((3, n), dtype=float)
-
-        for j in range(n):
-            q_pert = q.copy()
-            q_pert[j] += step
-
-            p_pert = self._fk_pos(q_pert)
-            if p_pert is None:
-                self.get_logger().error(
-                    f"FK failed while computing Jacobian column {j}"
-                )
-                return None, None
-
-            J[:, j] = (p_pert - p0) / step
-
-        return J, p0
-
-    def _fk_pos(self, q):
-        """Call FK service and wait for response"""
-        if not self.fk_client.wait_for_service(timeout_sec=5.0):
-            print("Service not available!")
-            return None
-        
-        req = GetPositionFK.Request()
-        req.header.frame_id = "base_footprint"
-        req.fk_link_names = ["arm_right_7_link"]
-        
-        rs = RobotState()
-        rs.joint_state.name = self.joint_names
-        rs.joint_state.position = q.tolist()
-        req.robot_state = rs
-        
-        #print("Calling FK service...")
-        future = self.fk_client.call_async(req)
-        
-        # Wait for response with proper ROS spinning
-        count = 0
-        while not future.done() and count < 100:
-            rclpy.spin_once(self, timeout_sec=0.05)
-            count += 1
-            #print(count)
-            
-        if not future.done():
-            print("Timed out waiting for FK response")
-            return None
-        
-        res = future.result()
-
-        if res is None:
-            print("FK service call returned None")
-            return None
-
-        if res.error_code.val != res.error_code.SUCCESS:
-            print(f"FK FAILED with code {res.error_code.val}")
-            return None
-        
-        pose: PoseStamped = res.pose_stamped[0]
-        p = pose.pose.position
-        return np.array([p.x, p.y, p.z], dtype=float)
-
 
 # -------- WEBSOCKET PART --------
 
@@ -296,13 +288,14 @@ def websocket_server_thread(node):
         print(f"WebSocket server error: {e}")
 
 
-def step(node, eePos=None):
+def step(node, statevec=None):
     """Update desired pose from WebSocket"""
-    if eePos is not None:
-        node.x_des = np.array([eePos[0], eePos[1], eePos[2]])
-        quat = pin.Quaternion(eePos[3], eePos[4], eePos[5], eePos[6])
+    if statevec is not None:
+        node.x_des = np.array([statevec[0], statevec[1], statevec[2]])
+        quat = pin.Quaternion(statevec[3], statevec[4], statevec[5], statevec[6])
         quat.normalize()
         node.R_des = quat.toRotationMatrix()
+        node.F_des = np.array([statevec[7], statevec[8], statevec[9], statevec[10], statevec[11], statevec[12]])
         print("newpos")
 
 
@@ -313,6 +306,18 @@ def websocket_handler(websocket, node):
             data = json.loads(message)
             print(f"Received: {data}")
             step(node, data)
+
+            response = json.dumps([node.F_ext[0],
+                                   node.F_ext[1],
+                                   node.F_ext[2],
+                                   node.F_ext[3],
+                                   node.F_ext[4],
+                                   node.F_ext[5]]).encode()
+            websocket.send(response)
+
+            print("send:")
+            print(response)
+
         except Exception as e:
             print(f"Error: {e}")
 
@@ -341,8 +346,9 @@ def main():
         while rclpy.ok():
             rclpy.spin_once(node)
             node.control_timer_callback()
-            time.sleep(0.01)
     except KeyboardInterrupt:
+        tau_zeros = np.array([0,0,0,0,0,0,0])
+        node.effort_pub.publish(Float64MultiArray(data=tau_zeros.tolist()))
         print("Shutting down...")
     finally:
         rclpy.shutdown()
@@ -359,7 +365,7 @@ if __name__ == '__main__':
             #   at the same q, both should return the same xyz
             pin.forwardKinematics(self.model, self.data, self.full_q)
             pin.updateFramePlacements(self.model, self.data)
-            frame_id = self.model.getFrameId("arm_right_7_link")
+            frame_id = self.model.getFrameId("arm_left_7_link")
             
             x_pinocchio = self.data.oMf[frame_id].translation
             x_moveit    = self._fk_pos(self.q)   # your existing service call
